@@ -1,404 +1,266 @@
 #!/usr/bin/env python3
-import os
+import sys
 import struct
-import csv
-from dataclasses import dataclass
 from pathlib import Path
 
-# -----------------------------
-# Helpers
-# -----------------------------
+from osgeo import ogr, osr
+
+
+ARCSEC_1_100_TO_DEG = 1.0 / (100.0 * 3600.0)
+
+CHECK_VALUE = 24575  # fixed int in header
+
 
 def read_exact(f, n):
     b = f.read(n)
     if len(b) != n:
-        raise EOFError(f"Unexpected EOF while reading {n} bytes")
+        raise EOFError(f"Unexpected EOF (wanted {n} bytes, got {len(b)})")
     return b
 
-def int16(b, endian):
-    return int.from_bytes(b, endian, signed=True)
 
-def guess_endian(byte_order_identifier):
-    # 1 = LSB little endian, 2 = MSB big endian
-    if byte_order_identifier == 1:
-        return "<"  # little
-    if byte_order_identifier == 2:
-        return ">"  # big
-    # fallback: document says unknown not used; still default to little
-    return "<"
+def detect_endian_and_read_first(f):
+    """
+    Reads first 8 bytes total enough to test:
+    - file_type_identifier (2 bytes) at offset 0
+    - byte_order_identifier (2 bytes) at offset 2
+    - byte_order_check_value (2 bytes) at offset 4
+    """
+    f.seek(0)
+    first8 = read_exact(f, 8)
 
-@dataclass
-class GeneralHeader:
-    file_type_identifier: int
-    byte_order_identifier: int
-    byte_order_check_value: int
-    segment_version_code: int
-    segment_creation_date: int
-    segment_name: str
-    location_reference: int
-    elevation_reference: int
-    lon_nw: int
-    lat_nw: int
-    lon_ne: int
-    lat_ne: int
-    lon_sw: int
-    lat_sw: int
-    lon_se: int
-    lat_se: int
-    lon_segment_size: int
-    lat_segment_size: int
-    lon_resolution: int
-    lat_resolution: int
-    lon_first_post: int
-    lat_first_post: int
-    num_columns: int
-    num_rows: int
-    content_identifier: list  # 10 ints
+    for endian in ("<", ">"):
+        filetype = struct.unpack_from(f"{endian}h", first8, 0)[0]
+        boi = struct.unpack_from(f"{endian}h", first8, 2)[0]
+        check = struct.unpack_from(f"{endian}h", first8, 4)[0]
 
-def parse_general_header(f):
-    # Offsets/sizes from doc: total 116 bytes
+        if check == CHECK_VALUE:
+            return endian, filetype, boi
+
+    raise ValueError("Cannot detect endian (byte order check value != 24575)")
+
+
+def parse_general_header(f, endian):
+    # total 116 bytes
+    f.seek(0)
     b = read_exact(f, 116)
-    # Little-endian vs big-endian: we need byte_order_identifier to know format.
-    # But byte_order_identifier itself is inside the header; we can decode it as 2-byte integer
-    # using both endians. We'll read the first 2 bytes as file_type_identifier then interpret
-    # byte_order_identifier with a heuristic.
-    #
-    # Since file_type_identifier is 2 bytes at pos 0, we can read both and decide.
-    file_type_le = struct.unpack_from("<h", b, 0)[0]
-    file_type_be = struct.unpack_from(">h", b, 0)[0]
-    file_type_identifier = file_type_le if file_type_le in (1,2,3,4) else file_type_be
 
-    byte_order_identifier_le = struct.unpack_from("<h", b, 2)[0]
-    byte_order_identifier_be = struct.unpack_from(">h", b, 2)[0]
-    byte_order_identifier = byte_order_identifier_le if byte_order_identifier_le in (0,1,2) else byte_order_identifier_be
-
-    endian = guess_endian(byte_order_identifier)
-
-    # Now parse full header with proper endian
-    # Layout:
-    # 0  : data type identifier (2)
-    # 2  : byte order identifier (2)
-    # 4  : byte order check value (2)
-    # 6  : segment version code (4)
-    # 10 : segment creation date (4)
-    # 14 : segment name (14 bytes string)
-    # 28 : location reference (2)
-    # 30 : elevation reference (2)
-    # 32 : lon_nw (4) ... etc until 116
-    fmt_prefix = endian
-    # build format string for known fields
-    # total fields: 
-    # h h h i i 14s h h + 14 ints? let's enumerate:
-    # lon_nw lat_nw lon_ne lat_ne lon_sw lat_sw lon_se lat_se (8)
-    # lon_segment_size lat_segment_size lon_resolution lat_resolution (4)
-    # lon_first_post lat_first_post (2)
-    # num_columns num_rows (2)
-    # then 10 content identifiers (10 * h)
-    fmt = (
-        f"{endian}h"   # file_type_identifier
-        f"{endian}h"   # byte_order_identifier
-        f"{endian}h"   # check
-        f"{endian}i"   # version
-        f"{endian}i"   # creation date
-        f"{endian}14s" # segment name
-        f"{endian}h"   # LR
-        f"{endian}h"   # ER
-        f"{endian}i{endian}i"  # lon_nw, lat_nw
-        f"{endian}i{endian}i"  # lon_ne, lat_ne
-        f"{endian}i{endian}i"  # lon_sw, lat_sw
-        f"{endian}i{endian}i"  # lon_se, lat_se
-        f"{endian}i{endian}i"  # lon_segment_size, lat_segment_size
-        f"{endian}i{endian}i"  # lon_resolution, lat_resolution
-        f"{endian}i{endian}i"  # lon_first_post, lat_first_post
-        f"{endian}i{endian}i"  # num_columns, num_rows
-        + f"{endian}" + ("h" * 10)  # content identifiers
-    )
-
-    unpacked = struct.unpack(fmt, b)
     idx = 0
-    file_type_identifier = unpacked[idx]; idx+=1
-    byte_order_identifier = unpacked[idx]; idx+=1
-    byte_order_check_value = unpacked[idx]; idx+=1
-    segment_version_code = unpacked[idx]; idx+=1
-    segment_creation_date = unpacked[idx]; idx+=1
-    segment_name_bytes = unpacked[idx]; idx+=1
+    file_type_identifier = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
+    byte_order_identifier = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
+    byte_order_check_value = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
+
+    segment_version_code = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    segment_creation_date = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+
+    segment_name_bytes = struct.unpack_from(f"{endian}14s", b, idx)[0]; idx += 14
     segment_name = segment_name_bytes.decode("ascii", errors="ignore")
-    location_reference = unpacked[idx]; idx+=1
-    elevation_reference = unpacked[idx]; idx+=1
-    lon_nw, lat_nw = unpacked[idx], unpacked[idx+1]; idx+=2
-    lon_ne, lat_ne = unpacked[idx], unpacked[idx+1]; idx+=2
-    lon_sw, lat_sw = unpacked[idx], unpacked[idx+1]; idx+=2
-    lon_se, lat_se = unpacked[idx], unpacked[idx+1]; idx+=2
-    lon_segment_size, lat_segment_size = unpacked[idx], unpacked[idx+1]; idx+=2
-    lon_resolution, lat_resolution = unpacked[idx], unpacked[idx+1]; idx+=2
-    lon_first_post, lat_first_post = unpacked[idx], unpacked[idx+1]; idx+=2
-    num_columns, num_rows = unpacked[idx], unpacked[idx+1]; idx+=2
-    content_identifier = list(unpacked[idx:idx+10]); idx+=10
 
-    return GeneralHeader(
-        file_type_identifier=file_type_identifier,
-        byte_order_identifier=byte_order_identifier,
-        byte_order_check_value=byte_order_check_value,
-        segment_version_code=segment_version_code,
-        segment_creation_date=segment_creation_date,
-        segment_name=segment_name,
-        location_reference=location_reference,
-        elevation_reference=elevation_reference,
-        lon_nw=lon_nw, lat_nw=lat_nw,
-        lon_ne=lon_ne, lat_ne=lat_ne,
-        lon_sw=lon_sw, lat_sw=lat_sw,
-        lon_se=lon_se, lat_se=lat_se,
-        lon_segment_size=lon_segment_size, lat_segment_size=lat_segment_size,
-        lon_resolution=lon_resolution, lat_resolution=lat_resolution,
-        lon_first_post=lon_first_post, lat_first_post=lat_first_post,
-        num_columns=num_columns,
-        num_rows=num_rows,
-        content_identifier=content_identifier
-    )
+    location_reference = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
+    elevation_reference = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
 
-def arcsec100_to_deg(v):
-    # values in 1/100 arc-seconds -> deg
-    # 1 arcsec = 1/3600 deg => (1/100 arcsec) = 1/(100*3600) deg
-    return v / (100.0 * 3600.0)
+    lon_nw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_nw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-def write_points_csv(path, rows):
-    # rows: list of dicts
-    fieldnames = sorted(rows[0].keys()) if rows else []
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
+    lon_ne = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_ne = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-# -----------------------------
-# Extraction for ELV (*.elv)
-# -----------------------------
+    lon_sw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_sw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-def parse_elevation_file(file_path, out_dir):
-    with open(file_path, "rb") as f:
-        gh = parse_general_header(f)
-        endian = guess_endian(gh.byte_order_identifier)
+    lon_se = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_se = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-        # Elevation file header (20 bytes)
-        # position 0: Elevation file version code (i)
-        # position 4: creation date (i)
-        # position 8: elevation scale (h)
-        # position 10: elevation type (h)
-        # position 12: bytes per elevation (=2) (h)
-        # position 14: minimal segment elevation (h)
-        # position 16: maximal segment elevation (h)
-        # position 18: no data value (h)
-        eh = read_exact(f, 20)
-        (ev_ver, ev_date, elevation_scale, elevation_type, bytes_per_elev,
-         min_seg_elev, max_seg_elev, no_data_value) = struct.unpack(
-            f"{endian}ii h h h h h h", eh
-        )
+    lon_segment_size = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_segment_size = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-        # data scale: values to be divided by scale to get meters
-        data_scale = elevation_scale  # per doc it is the "data scale" field in general section? Here we interpret
-        # Actually doc says data_scale field is in general header positions 5.20 (2 bytes) but general header we parsed
-        # does not include it in our extraction. That means our earlier general-header parsing does NOT include data_scale.
-        # The doc indicates data_scale is separate at 5.20 likely in some later header sections.
-        # To keep this working, we will use elevation_scale as "scale" only if it matches expected.
-        # If you want perfect units, we need the exact mapping of data_scale bytes position in the general header or file header.
-        #
-        # We'll still output raw values scaled by (1/elevation_scale) if elevation_scale != 0.
-        scale_divisor = elevation_scale if elevation_scale != 0 else 1
+    lon_resolution = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_resolution = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-        num_rows = gh.num_rows
-        num_cols = gh.num_columns
+    lon_first_post = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    lat_first_post = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-        # record layout (from doc):
-        # counter (i) =4
-        # minimal record elevation (h)=2
-        # maximal record elevation (h)=2
-        # longitude first elevation post (i)=4
-        # latitude first elevation post (i)=4
-        # then number_of_columns elevation posts (each h=2)
-        # total = 14 + 2*num_cols
-        rec_struct_prefix = f"{endian}i h h i i"
-        posts_fmt = f"{endian}{num_cols}h"
-        rec_header_size = struct.calcsize(rec_struct_prefix)
-        rec_size = 14 + 2 * num_cols
+    num_columns = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
+    num_rows = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
 
-        out_csv = Path(out_dir) / (Path(file_path).stem + "_elv.csv")
-        os.makedirs(out_dir, exist_ok=True)
-
-        with open(out_csv, "w", newline="", encoding="utf-8") as fout:
-            fieldnames = ["segment_name", "record_counter", "row_lat_deg", "col_lon_deg", "elevation_raw", "elevation_m"]
-            w = csv.DictWriter(fout, fieldnames=fieldnames)
-            w.writeheader()
-
-            # row-major: records for constant latitude, from north to south
-            for _ in range(num_rows):
-                block = read_exact(f, rec_size)
-                # unpack record
-                head = struct.unpack_from(rec_struct_prefix, block, 0)
-                counter, min_rec, max_rec, lon_first, lat_first = head
-                posts = struct.unpack_from(posts_fmt, block, rec_header_size)
-
-                row_lat_deg = arcsec100_to_deg(lat_first)
-                # each post corresponds to consecutive longitudes
-                # lon_resolution in 1/100 arc-seconds
-                for j, elev_raw in enumerate(posts):
-                    lon_deg = arcsec100_to_deg(lon_first + j * gh.lon_resolution)
-                    elev_m = None
-                    if elev_raw != no_data_value:
-                        elev_m = elev_raw / float(scale_divisor)
-                    w.writerow({
-                        "segment_name": gh.segment_name.strip(),
-                        "record_counter": counter,
-                        "row_lat_deg": row_lat_deg,
-                        "col_lon_deg": lon_deg,
-                        "elevation_raw": elev_raw,
-                        "elevation_m": "" if elev_m is None else elev_m
-                    })
-
-    return str(out_csv)
-
-# -----------------------------
-# Extraction for QUALITY (*.qty)
-# -----------------------------
-
-def parse_quality_definition_records(f, gh, endian, quality_header_bytes=20):
-    # Quality file header (20 bytes)
-    qb = read_exact(f, 20)
-    (qv_ver, qv_date, accuracy_scale, num_q_defs, bytes_per_def,
-     min_seg_q, max_seg_q, no_data_value) = struct.unpack(
-        f"{endian}ii h h h h h h", qb
-    )
-
-    # Then quality definition records: count = num_q_defs
-    # Each definition record size = 50 bytes:
-    # quality_tag_id (h)
-    # sigma1 abs hor (i) sigma1 rel hor (i) ... etc total 50
-    # From doc: fields are 1 h + 12 ints? (actually 1 tag + 12 ints = 2 + 48 = 50)
-    defs = []
-    for _ in range(num_q_defs):
-        db = read_exact(f, 50)
-        vals = struct.unpack(f"{endian}h i i i i i i i i i i i i", db)
-        qtag_id = vals[0]
-        # remaining 12 ints correspond to:
-        # abs_h_sigma1, rel_h_sigma1, abs_v_sigma1, rel_v_sigma1, abs_h_sigma2, rel_h_sigma2,
-        # abs_v_sigma2, rel_v_sigma2, abs_h_sigma3, rel_h_sigma3, abs_v_sigma3, rel_v_sigma3
-        defs.append((qtag_id, vals[1:]))
+    content_identifiers = list(struct.unpack_from(f"{endian}10h", b, idx))
 
     return {
-        "accuracy_scale": accuracy_scale,
-        "num_q_defs": num_q_defs,
-        "bytes_per_def": bytes_per_def,
-        "no_data_value": no_data_value,
-        "definitions": defs
+        "file_type_identifier": file_type_identifier,
+        "segment_name": segment_name.rstrip(),
+        "elevation_reference": elevation_reference,
+        "lon_resolution": lon_resolution,
+        "lat_resolution": lat_resolution,
+        "lon_first_post": lon_first_post,
+        "lat_first_post": lat_first_post,
+        "num_columns": num_columns,
+        "num_rows": num_rows,
+        "content_identifiers": content_identifiers,
     }
 
-def parse_quality_file(file_path, out_dir):
-    with open(file_path, "rb") as f:
-        gh = parse_general_header(f)
-        endian = guess_endian(gh.byte_order_identifier)
 
-        qinfo = parse_quality_definition_records(f, gh, endian)
+def parse_elevation_file_header(f, endian):
+    # 20 bytes
+    b = read_exact(f, 20)
+    ev_version = struct.unpack_from(f"{endian}i", b, 0)[0]
+    ev_creation_date = struct.unpack_from(f"{endian}i", b, 4)[0]
+    elevation_scale = struct.unpack_from(f"{endian}h", b, 8)[0]  # data_scale (divisor to meters)
+    elevation_type = struct.unpack_from(f"{endian}h", b, 10)[0]
+    bytes_per_elev = struct.unpack_from(f"{endian}h", b, 12)[0]
+    min_seg = struct.unpack_from(f"{endian}h", b, 14)[0]
+    max_seg = struct.unpack_from(f"{endian}h", b, 16)[0]
+    no_data = struct.unpack_from(f"{endian}h", b, 18)[0]
 
-        num_rows = gh.num_rows
-        num_cols = gh.num_columns
-        num_q_defs = qinfo["num_q_defs"]
+    return {
+        "elevation_scale": elevation_scale,
+        "elevation_type": elevation_type,
+        "bytes_per_elev": bytes_per_elev,
+        "no_data": no_data,
+    }
 
-        # After definition records, comes quality tag data:
-        # each quality tag record:
-        # counter (i) + min_tag(h)+max_tag(h)+ lon_first(i)+lat_first(i) + number_of_columns tags (h)
-        # size = 16 + 2*num_cols
-        rec_struct_prefix = f"{endian}i h h i i"  # 16? actually i=4, h=2, h=2, i=4, i=4 => 16
+
+def water_corrected(raw, no_data):
+    """
+    Returns (elev_raw, elev_maybe_corrected_offset, detected_offset_flag)
+    Offsets are negative; if raw is close to offset then the post is water.
+    """
+    if raw == no_data:
+        return None, None
+
+    sea_offset = -20000
+    lake_offset = -30000
+
+    # Heuristic: if raw is <= -20000 and closer to one of offsets.
+    # In practice raw = offset + height_m*scale. Height_m*scale is non-negative.
+    if raw <= sea_offset:
+        # distance to offsets
+        d_sea = abs(raw - sea_offset)
+        d_lake = abs(raw - lake_offset)
+        if d_lake < d_sea:
+            return raw - lake_offset, lake_offset
+        else:
+            return raw - sea_offset, sea_offset
+
+    return raw, None
+
+
+def elv_to_gpkg_points(elv_path, out_gpkg_path):
+    elv_path = Path(elv_path)
+    out_gpkg_path = Path(out_gpkg_path)
+
+    with open(elv_path, "rb") as f:
+        endian, filetype, boi = detect_endian_and_read_first(f)
+        if filetype != 1:
+            raise ValueError(f"Not an Elevation file. file_type_identifier={filetype}")
+
+        gh = parse_general_header(f, endian)
+
+        # after general header, elevation header begins at offset 116
+        f.seek(116)
+        eh = parse_elevation_file_header(f, endian)
+
+        data_scale = eh["elevation_scale"]
+        no_data = eh["no_data"]
+        num_rows = gh["num_rows"]
+        num_cols = gh["num_columns"]
+
+        if eh["bytes_per_elev"] != 2:
+            raise NotImplementedError("Ce script suppose bytes_per_elevation == 2 (taille 2 octets).")
+
+        # record header:
+        # counter(i) + min(h) + max(h) + lon_first(i) + lat_first(i) => 4+2+2+4+4 = 16
+        # but doc says record stats start at pos 0 with counter at 0 then min at 4 then max at 6 etc => total before posts = 16
+        rec_header_fmt = f"{endian}i h h i i"
+        rec_header_size = struct.calcsize(rec_header_fmt)  # 16
         posts_fmt = f"{endian}{num_cols}h"
-        rec_header_size = struct.calcsize(rec_struct_prefix)
-        rec_size = 16 + 2 * num_cols
+        record_size = rec_header_size + 2 * num_cols
 
-        # quality tag meanings from definitions
-        # map qtag_id -> accuracies list
-        def_map = {qtag_id: vals for (qtag_id, vals) in qinfo["definitions"]}
+        # Create GPKG layer
+        drv = ogr.GetDriverByName("GPKG")
+        if out_gpkg_path.exists():
+            drv.DeleteDataSource(str(out_gpkg_path))
 
-        out_csv = Path(out_dir) / (Path(file_path).stem + "_qty.csv")
-        os.makedirs(out_dir, exist_ok=True)
+        ds = drv.CreateDataSource(str(out_gpkg_path))
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)  # WGS84 lat/lon
 
-        with open(out_csv, "w", newline="", encoding="utf-8") as fout:
-            fieldnames = [
-                "segment_name", "record_counter", "row_lat_deg", "col_lon_deg",
-                "quality_tag_id",
-                "abs_h_sigma1", "rel_h_sigma1", "abs_v_sigma1", "rel_v_sigma1"
-            ]
-            w = csv.DictWriter(fout, fieldnames=fieldnames)
-            w.writeheader()
+        layer = ds.CreateLayer(gh["segment_name"] or elv_path.stem, srs=srs, geom_type=ogr.wkbPoint)
 
-            for _ in range(num_rows):
-                block = read_exact(f, rec_size)
-                head = struct.unpack_from(rec_struct_prefix, block, 0)
-                counter, min_tag, max_tag, lon_first, lat_first = head
-                tags = struct.unpack_from(posts_fmt, block, rec_header_size)
+        # Fields
+        def add_field(name, ftype=ogr.OFTReal):
+            layer.CreateField(ogr.FieldDefn(name, ftype))
 
-                row_lat_deg = arcsec100_to_deg(lat_first)
-                for j, tag in enumerate(tags):
-                    lon_deg = arcsec100_to_deg(lon_first + j * gh.lon_resolution)
+        layer.CreateField(ogr.FieldDefn("segment_name", ogr.OFTString))
+        layer.CreateField(ogr.FieldDefn("record_counter", ogr.OFTInteger))
+        layer.CreateField(ogr.FieldDefn("row", ogr.OFTInteger))
+        layer.CreateField(ogr.FieldDefn("col", ogr.OFTInteger))
+        layer.CreateField(ogr.FieldDefn("lon_deg", ogr.OFTReal))
+        layer.CreateField(ogr.FieldDefn("lat_deg", ogr.OFTReal))
+        layer.CreateField(ogr.FieldDefn("elev_raw", ogr.OFTReal))
+        layer.CreateField(ogr.FieldDefn("elev_m_scaled", ogr.OFTReal))
+        layer.CreateField(ogr.FieldDefn("elev_m_water_corrected", ogr.OFTReal))
+        layer.CreateField(ogr.FieldDefn("water_offset", ogr.OFTReal))
 
-                    # If tag is NO_DATA, skip/blank
-                    acc = def_map.get(tag)
-                    if acc is None:
-                        # unknown tag
-                        w.writerow({
-                            "segment_name": gh.segment_name.strip(),
-                            "record_counter": counter,
-                            "row_lat_deg": row_lat_deg,
-                            "col_lon_deg": lon_deg,
-                            "quality_tag_id": tag,
-                            "abs_h_sigma1": "",
-                            "rel_h_sigma1": "",
-                            "abs_v_sigma1": "",
-                            "rel_v_sigma1": ""
-                        })
-                    else:
-                        # acc contains 12 ints in order described above
-                        abs_h_sigma1, rel_h_sigma1, abs_v_sigma1, rel_v_sigma1 = acc[0], acc[1], acc[2], acc[3]
-                        w.writerow({
-                            "segment_name": gh.segment_name.strip(),
-                            "record_counter": counter,
-                            "row_lat_deg": row_lat_deg,
-                            "col_lon_deg": lon_deg,
-                            "quality_tag_id": tag,
-                            "abs_h_sigma1": abs_h_sigma1,
-                            "rel_h_sigma1": rel_h_sigma1,
-                            "abs_v_sigma1": abs_v_sigma1,
-                            "rel_v_sigma1": rel_v_sigma1
-                        })
+        lon_resolution = gh["lon_resolution"]
+        lat_first_post_arcsec100 = gh["lat_first_post"]
 
-    return str(out_csv)
+        # NW to SE, row-major:
+        for r in range(num_rows):
+            block = read_exact(f, record_size)
+            counter, min_rec, max_rec, lon_first_rec, lat_first_rec = struct.unpack_from(rec_header_fmt, block, 0)
+            posts = struct.unpack_from(posts_fmt, block, rec_header_size)
 
-# -----------------------------
-# Main
-# -----------------------------
+            lat_deg = lat_first_rec * ARCSEC_1_100_TO_DEG
 
-def main(input_dir, output_dir):
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
+            for c, elev_raw in enumerate(posts):
+                lon_arcsec100 = lon_first_rec + c * lon_resolution
+                lon_deg = lon_arcsec100 * ARCSEC_1_100_TO_DEG
 
-    generated = []
-    for p in input_dir.rglob("*"):
-        if p.is_file() and p.suffix.lower() in [".elv", ".qty"]:
-            try:
-                if p.suffix.lower() == ".elv":
-                    out = parse_elevation_file(str(p), str(output_dir))
-                    print(f"[OK] ELV: {p} -> {out}")
-                    generated.append(out)
+                if elev_raw == no_data:
+                    elev_m_scaled = None
+                    elev_m_water = None
+                    water_offset = None
                 else:
-                    out = parse_quality_file(str(p), str(output_dir))
-                    print(f"[OK] QTY: {p} -> {out}")
-                    generated.append(out)
-            except Exception as e:
-                print(f"[ERR] {p}: {e}")
+                    elev_m_scaled = elev_raw / float(data_scale) if data_scale != 0 else elev_raw
+                    # water-corrected works in raw units first; then convert to meters:
+                    # water_corrected returns raw_without_offset in raw-units
+                    corrected_raw, offset_used = water_corrected(elev_raw, no_data)
+                    if corrected_raw is None:
+                        elev_m_water = None
+                        water_offset = None
+                    else:
+                        elev_m_water = corrected_raw / float(data_scale) if data_scale != 0 else corrected_raw
+                        water_offset = offset_used
 
-    print(f"Done. Extracted {len(generated)} CSV files to: {output_dir}")
+                geom = ogr.Geometry(ogr.wkbPoint)
+                geom.AddPoint(lon_deg, lat_deg)
+
+                feat = ogr.Feature(layer.GetLayerDefn())
+                feat.SetGeometry(geom)
+                feat.SetField("segment_name", gh["segment_name"])
+                feat.SetField("record_counter", int(counter))
+                feat.SetField("row", int(r))
+                feat.SetField("col", int(c))
+                feat.SetField("lon_deg", float(lon_deg))
+                feat.SetField("lat_deg", float(lat_deg))
+                feat.SetField("elev_raw", float(elev_raw))
+                feat.SetField("elev_m_scaled", float(elev_m_scaled) if elev_m_scaled is not None else None)
+                feat.SetField("elev_m_water_corrected", float(elev_m_water) if elev_m_water is not None else None)
+                feat.SetField("water_offset", float(water_offset) if water_offset is not None else None)
+
+                layer.CreateFeature(feat)
+                feat = None
+
+        ds = None  # flush
+
+    return str(out_gpkg_path)
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python3 elv_to_gpkg_points.py <path_to_050w29ss.elv> <output.gpkg>")
+        sys.exit(1)
+    elv_to_gpkg_points(sys.argv[1], sys.argv[2])
+    print("OK")
 
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="Extract Thales Terrain Database DEM (*.elv/*.qty) to CSV.")
-    ap.add_argument("input_dir", help="Root directory containing segment tiles (.elv/.qty)")
-    ap.add_argument("output_dir", help="Directory to write CSV outputs")
-    args = ap.parse_args()
-    main(args.input_dir, args.output_dir)
+    main()
