@@ -1,19 +1,404 @@
-import struct import csv from pathlib import Path 
-def read_thales_elevation_file(file_path, output_csv=None): """ Lit un fichier d'élévation Thales (.elv) et extrait les altitudes. Args: file_path (str): Chemin vers le fichier binaire. output_csv (str, optional): Chemin pour exporter en CSV. Si None, n'exporte pas. Returns: list: Matrice 2D des altitudes (ou None pour "No Data"). """ with open(file_path, "rb") as f: # --- 1. Lire le General Header (32 octets) --- general_header = f.read(32) 
-# Extraire le Byte Order (octet 2, 2 bytes) f.seek(2) byte_order_data = f.read(2) byte_order = "little" if byte_order_data == b'\x01\x00' else "big" 
-# Extraire Number of Columns (octet 27, 2 bytes) f.seek(26) num_columns = int.from_bytes(f.read(2), byteorder=byte_order) 
-# Extraire Number of Rows (octet 29, 2 bytes) f.seek(28) num_rows = int.from_bytes(f.read(2), byteorder=byte_order) 
-# Extraire No Data Value (octet 18, 2 bytes) f.seek(18) no_data_value = int.from_bytes(f.read(2), byteorder=byte_order, signed=True) 
-# --- 2. Lire l'Elevation File Header (20 octets) --- f.seek(32) # Début de l'Elevation Header elevation_header = f.read(20) 
-# Extraire Bytes Per Post (octet 12 de l'Elevation Header = position 32 + 12 = 44) f.seek(44) bytes_per_post = int.from_bytes(f.read(2), byteorder=byte_order) 
-# --- 3. Aller aux données (début à l'octet 52) --- f.seek(52) 
-# --- 4. Lire les altitudes --- elevations = [] for _ in range(num_rows): row = [] for _ in range(num_columns): data = f.read(bytes_per_post) if not data: # Fin de fichier prématurée raise ValueError("Fichier corrompu ou taille inattendue.") alt = int.from_bytes(data, byteorder=byte_order, signed=True) 
-# Appliquer les règles Thales if alt == no_data_value: row.append(None) # No Data elif alt == -20000: row.append(0) # Sea Water elif -30000 <= alt < -20000: row.append(alt + 30000) # Body Water else: row.append(alt) # Terrain elevations.append(row) 
-# --- 5. Exporter en CSV si demandé --- if output_csv: with open(output_csv, "w", newline="") as csvfile: writer = csv.writer(csvfile) for row in elevations: # Remplacer None par "No Data" pour le CSV csv_row = ["No Data" if x is None else x for x in row] writer.writerow(csv_row) print(f"✅ Export CSV terminé : {Path(output_csv).absolute()}") 
-return elevations 
-# --- EXEMPLE D'UTILISATION --- if __name__ == "__main__": # Remplacez par le chemin de votre fichier input_file = "terrain.elv" # ou "segment_001.elv", etc. 
-# Chemin pour le CSV (optionnel, mettez None si vous ne voulez pas exporter) output_csv = "elevations.csv" 
-try: elevations = read_thales_elevation_file(input_file, output_csv) 
-# Afficher les 5 premières lignes print("📊 Aperçu des données extraites (5 premières lignes) :") for i, row in enumerate(elevations[:5]): print(f"Ligne {i + 1}: {row}") 
-print(f"\n✅ Fichier lu avec succès !") print(f" - Colonnes: {len(elevations[0]) if elevations else 0}") print(f" - Lignes: {len(elevations)}") print(f" - Export CSV: {'Oui' if output_csv else 'Non'}") 
-except FileNotFoundError: print(f"❌ Erreur: Fichier introuvable -> {input_file}") except Exception as e: print(f"❌ Erreur lors de la lecture: {str(e)}")
+#!/usr/bin/env python3
+import os
+import struct
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def read_exact(f, n):
+    b = f.read(n)
+    if len(b) != n:
+        raise EOFError(f"Unexpected EOF while reading {n} bytes")
+    return b
+
+def int16(b, endian):
+    return int.from_bytes(b, endian, signed=True)
+
+def guess_endian(byte_order_identifier):
+    # 1 = LSB little endian, 2 = MSB big endian
+    if byte_order_identifier == 1:
+        return "<"  # little
+    if byte_order_identifier == 2:
+        return ">"  # big
+    # fallback: document says unknown not used; still default to little
+    return "<"
+
+@dataclass
+class GeneralHeader:
+    file_type_identifier: int
+    byte_order_identifier: int
+    byte_order_check_value: int
+    segment_version_code: int
+    segment_creation_date: int
+    segment_name: str
+    location_reference: int
+    elevation_reference: int
+    lon_nw: int
+    lat_nw: int
+    lon_ne: int
+    lat_ne: int
+    lon_sw: int
+    lat_sw: int
+    lon_se: int
+    lat_se: int
+    lon_segment_size: int
+    lat_segment_size: int
+    lon_resolution: int
+    lat_resolution: int
+    lon_first_post: int
+    lat_first_post: int
+    num_columns: int
+    num_rows: int
+    content_identifier: list  # 10 ints
+
+def parse_general_header(f):
+    # Offsets/sizes from doc: total 116 bytes
+    b = read_exact(f, 116)
+    # Little-endian vs big-endian: we need byte_order_identifier to know format.
+    # But byte_order_identifier itself is inside the header; we can decode it as 2-byte integer
+    # using both endians. We'll read the first 2 bytes as file_type_identifier then interpret
+    # byte_order_identifier with a heuristic.
+    #
+    # Since file_type_identifier is 2 bytes at pos 0, we can read both and decide.
+    file_type_le = struct.unpack_from("<h", b, 0)[0]
+    file_type_be = struct.unpack_from(">h", b, 0)[0]
+    file_type_identifier = file_type_le if file_type_le in (1,2,3,4) else file_type_be
+
+    byte_order_identifier_le = struct.unpack_from("<h", b, 2)[0]
+    byte_order_identifier_be = struct.unpack_from(">h", b, 2)[0]
+    byte_order_identifier = byte_order_identifier_le if byte_order_identifier_le in (0,1,2) else byte_order_identifier_be
+
+    endian = guess_endian(byte_order_identifier)
+
+    # Now parse full header with proper endian
+    # Layout:
+    # 0  : data type identifier (2)
+    # 2  : byte order identifier (2)
+    # 4  : byte order check value (2)
+    # 6  : segment version code (4)
+    # 10 : segment creation date (4)
+    # 14 : segment name (14 bytes string)
+    # 28 : location reference (2)
+    # 30 : elevation reference (2)
+    # 32 : lon_nw (4) ... etc until 116
+    fmt_prefix = endian
+    # build format string for known fields
+    # total fields: 
+    # h h h i i 14s h h + 14 ints? let's enumerate:
+    # lon_nw lat_nw lon_ne lat_ne lon_sw lat_sw lon_se lat_se (8)
+    # lon_segment_size lat_segment_size lon_resolution lat_resolution (4)
+    # lon_first_post lat_first_post (2)
+    # num_columns num_rows (2)
+    # then 10 content identifiers (10 * h)
+    fmt = (
+        f"{endian}h"   # file_type_identifier
+        f"{endian}h"   # byte_order_identifier
+        f"{endian}h"   # check
+        f"{endian}i"   # version
+        f"{endian}i"   # creation date
+        f"{endian}14s" # segment name
+        f"{endian}h"   # LR
+        f"{endian}h"   # ER
+        f"{endian}i{endian}i"  # lon_nw, lat_nw
+        f"{endian}i{endian}i"  # lon_ne, lat_ne
+        f"{endian}i{endian}i"  # lon_sw, lat_sw
+        f"{endian}i{endian}i"  # lon_se, lat_se
+        f"{endian}i{endian}i"  # lon_segment_size, lat_segment_size
+        f"{endian}i{endian}i"  # lon_resolution, lat_resolution
+        f"{endian}i{endian}i"  # lon_first_post, lat_first_post
+        f"{endian}i{endian}i"  # num_columns, num_rows
+        + f"{endian}" + ("h" * 10)  # content identifiers
+    )
+
+    unpacked = struct.unpack(fmt, b)
+    idx = 0
+    file_type_identifier = unpacked[idx]; idx+=1
+    byte_order_identifier = unpacked[idx]; idx+=1
+    byte_order_check_value = unpacked[idx]; idx+=1
+    segment_version_code = unpacked[idx]; idx+=1
+    segment_creation_date = unpacked[idx]; idx+=1
+    segment_name_bytes = unpacked[idx]; idx+=1
+    segment_name = segment_name_bytes.decode("ascii", errors="ignore")
+    location_reference = unpacked[idx]; idx+=1
+    elevation_reference = unpacked[idx]; idx+=1
+    lon_nw, lat_nw = unpacked[idx], unpacked[idx+1]; idx+=2
+    lon_ne, lat_ne = unpacked[idx], unpacked[idx+1]; idx+=2
+    lon_sw, lat_sw = unpacked[idx], unpacked[idx+1]; idx+=2
+    lon_se, lat_se = unpacked[idx], unpacked[idx+1]; idx+=2
+    lon_segment_size, lat_segment_size = unpacked[idx], unpacked[idx+1]; idx+=2
+    lon_resolution, lat_resolution = unpacked[idx], unpacked[idx+1]; idx+=2
+    lon_first_post, lat_first_post = unpacked[idx], unpacked[idx+1]; idx+=2
+    num_columns, num_rows = unpacked[idx], unpacked[idx+1]; idx+=2
+    content_identifier = list(unpacked[idx:idx+10]); idx+=10
+
+    return GeneralHeader(
+        file_type_identifier=file_type_identifier,
+        byte_order_identifier=byte_order_identifier,
+        byte_order_check_value=byte_order_check_value,
+        segment_version_code=segment_version_code,
+        segment_creation_date=segment_creation_date,
+        segment_name=segment_name,
+        location_reference=location_reference,
+        elevation_reference=elevation_reference,
+        lon_nw=lon_nw, lat_nw=lat_nw,
+        lon_ne=lon_ne, lat_ne=lat_ne,
+        lon_sw=lon_sw, lat_sw=lat_sw,
+        lon_se=lon_se, lat_se=lat_se,
+        lon_segment_size=lon_segment_size, lat_segment_size=lat_segment_size,
+        lon_resolution=lon_resolution, lat_resolution=lat_resolution,
+        lon_first_post=lon_first_post, lat_first_post=lat_first_post,
+        num_columns=num_columns,
+        num_rows=num_rows,
+        content_identifier=content_identifier
+    )
+
+def arcsec100_to_deg(v):
+    # values in 1/100 arc-seconds -> deg
+    # 1 arcsec = 1/3600 deg => (1/100 arcsec) = 1/(100*3600) deg
+    return v / (100.0 * 3600.0)
+
+def write_points_csv(path, rows):
+    # rows: list of dicts
+    fieldnames = sorted(rows[0].keys()) if rows else []
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+# -----------------------------
+# Extraction for ELV (*.elv)
+# -----------------------------
+
+def parse_elevation_file(file_path, out_dir):
+    with open(file_path, "rb") as f:
+        gh = parse_general_header(f)
+        endian = guess_endian(gh.byte_order_identifier)
+
+        # Elevation file header (20 bytes)
+        # position 0: Elevation file version code (i)
+        # position 4: creation date (i)
+        # position 8: elevation scale (h)
+        # position 10: elevation type (h)
+        # position 12: bytes per elevation (=2) (h)
+        # position 14: minimal segment elevation (h)
+        # position 16: maximal segment elevation (h)
+        # position 18: no data value (h)
+        eh = read_exact(f, 20)
+        (ev_ver, ev_date, elevation_scale, elevation_type, bytes_per_elev,
+         min_seg_elev, max_seg_elev, no_data_value) = struct.unpack(
+            f"{endian}ii h h h h h h", eh
+        )
+
+        # data scale: values to be divided by scale to get meters
+        data_scale = elevation_scale  # per doc it is the "data scale" field in general section? Here we interpret
+        # Actually doc says data_scale field is in general header positions 5.20 (2 bytes) but general header we parsed
+        # does not include it in our extraction. That means our earlier general-header parsing does NOT include data_scale.
+        # The doc indicates data_scale is separate at 5.20 likely in some later header sections.
+        # To keep this working, we will use elevation_scale as "scale" only if it matches expected.
+        # If you want perfect units, we need the exact mapping of data_scale bytes position in the general header or file header.
+        #
+        # We'll still output raw values scaled by (1/elevation_scale) if elevation_scale != 0.
+        scale_divisor = elevation_scale if elevation_scale != 0 else 1
+
+        num_rows = gh.num_rows
+        num_cols = gh.num_columns
+
+        # record layout (from doc):
+        # counter (i) =4
+        # minimal record elevation (h)=2
+        # maximal record elevation (h)=2
+        # longitude first elevation post (i)=4
+        # latitude first elevation post (i)=4
+        # then number_of_columns elevation posts (each h=2)
+        # total = 14 + 2*num_cols
+        rec_struct_prefix = f"{endian}i h h i i"
+        posts_fmt = f"{endian}{num_cols}h"
+        rec_header_size = struct.calcsize(rec_struct_prefix)
+        rec_size = 14 + 2 * num_cols
+
+        out_csv = Path(out_dir) / (Path(file_path).stem + "_elv.csv")
+        os.makedirs(out_dir, exist_ok=True)
+
+        with open(out_csv, "w", newline="", encoding="utf-8") as fout:
+            fieldnames = ["segment_name", "record_counter", "row_lat_deg", "col_lon_deg", "elevation_raw", "elevation_m"]
+            w = csv.DictWriter(fout, fieldnames=fieldnames)
+            w.writeheader()
+
+            # row-major: records for constant latitude, from north to south
+            for _ in range(num_rows):
+                block = read_exact(f, rec_size)
+                # unpack record
+                head = struct.unpack_from(rec_struct_prefix, block, 0)
+                counter, min_rec, max_rec, lon_first, lat_first = head
+                posts = struct.unpack_from(posts_fmt, block, rec_header_size)
+
+                row_lat_deg = arcsec100_to_deg(lat_first)
+                # each post corresponds to consecutive longitudes
+                # lon_resolution in 1/100 arc-seconds
+                for j, elev_raw in enumerate(posts):
+                    lon_deg = arcsec100_to_deg(lon_first + j * gh.lon_resolution)
+                    elev_m = None
+                    if elev_raw != no_data_value:
+                        elev_m = elev_raw / float(scale_divisor)
+                    w.writerow({
+                        "segment_name": gh.segment_name.strip(),
+                        "record_counter": counter,
+                        "row_lat_deg": row_lat_deg,
+                        "col_lon_deg": lon_deg,
+                        "elevation_raw": elev_raw,
+                        "elevation_m": "" if elev_m is None else elev_m
+                    })
+
+    return str(out_csv)
+
+# -----------------------------
+# Extraction for QUALITY (*.qty)
+# -----------------------------
+
+def parse_quality_definition_records(f, gh, endian, quality_header_bytes=20):
+    # Quality file header (20 bytes)
+    qb = read_exact(f, 20)
+    (qv_ver, qv_date, accuracy_scale, num_q_defs, bytes_per_def,
+     min_seg_q, max_seg_q, no_data_value) = struct.unpack(
+        f"{endian}ii h h h h h h", qb
+    )
+
+    # Then quality definition records: count = num_q_defs
+    # Each definition record size = 50 bytes:
+    # quality_tag_id (h)
+    # sigma1 abs hor (i) sigma1 rel hor (i) ... etc total 50
+    # From doc: fields are 1 h + 12 ints? (actually 1 tag + 12 ints = 2 + 48 = 50)
+    defs = []
+    for _ in range(num_q_defs):
+        db = read_exact(f, 50)
+        vals = struct.unpack(f"{endian}h i i i i i i i i i i i i", db)
+        qtag_id = vals[0]
+        # remaining 12 ints correspond to:
+        # abs_h_sigma1, rel_h_sigma1, abs_v_sigma1, rel_v_sigma1, abs_h_sigma2, rel_h_sigma2,
+        # abs_v_sigma2, rel_v_sigma2, abs_h_sigma3, rel_h_sigma3, abs_v_sigma3, rel_v_sigma3
+        defs.append((qtag_id, vals[1:]))
+
+    return {
+        "accuracy_scale": accuracy_scale,
+        "num_q_defs": num_q_defs,
+        "bytes_per_def": bytes_per_def,
+        "no_data_value": no_data_value,
+        "definitions": defs
+    }
+
+def parse_quality_file(file_path, out_dir):
+    with open(file_path, "rb") as f:
+        gh = parse_general_header(f)
+        endian = guess_endian(gh.byte_order_identifier)
+
+        qinfo = parse_quality_definition_records(f, gh, endian)
+
+        num_rows = gh.num_rows
+        num_cols = gh.num_columns
+        num_q_defs = qinfo["num_q_defs"]
+
+        # After definition records, comes quality tag data:
+        # each quality tag record:
+        # counter (i) + min_tag(h)+max_tag(h)+ lon_first(i)+lat_first(i) + number_of_columns tags (h)
+        # size = 16 + 2*num_cols
+        rec_struct_prefix = f"{endian}i h h i i"  # 16? actually i=4, h=2, h=2, i=4, i=4 => 16
+        posts_fmt = f"{endian}{num_cols}h"
+        rec_header_size = struct.calcsize(rec_struct_prefix)
+        rec_size = 16 + 2 * num_cols
+
+        # quality tag meanings from definitions
+        # map qtag_id -> accuracies list
+        def_map = {qtag_id: vals for (qtag_id, vals) in qinfo["definitions"]}
+
+        out_csv = Path(out_dir) / (Path(file_path).stem + "_qty.csv")
+        os.makedirs(out_dir, exist_ok=True)
+
+        with open(out_csv, "w", newline="", encoding="utf-8") as fout:
+            fieldnames = [
+                "segment_name", "record_counter", "row_lat_deg", "col_lon_deg",
+                "quality_tag_id",
+                "abs_h_sigma1", "rel_h_sigma1", "abs_v_sigma1", "rel_v_sigma1"
+            ]
+            w = csv.DictWriter(fout, fieldnames=fieldnames)
+            w.writeheader()
+
+            for _ in range(num_rows):
+                block = read_exact(f, rec_size)
+                head = struct.unpack_from(rec_struct_prefix, block, 0)
+                counter, min_tag, max_tag, lon_first, lat_first = head
+                tags = struct.unpack_from(posts_fmt, block, rec_header_size)
+
+                row_lat_deg = arcsec100_to_deg(lat_first)
+                for j, tag in enumerate(tags):
+                    lon_deg = arcsec100_to_deg(lon_first + j * gh.lon_resolution)
+
+                    # If tag is NO_DATA, skip/blank
+                    acc = def_map.get(tag)
+                    if acc is None:
+                        # unknown tag
+                        w.writerow({
+                            "segment_name": gh.segment_name.strip(),
+                            "record_counter": counter,
+                            "row_lat_deg": row_lat_deg,
+                            "col_lon_deg": lon_deg,
+                            "quality_tag_id": tag,
+                            "abs_h_sigma1": "",
+                            "rel_h_sigma1": "",
+                            "abs_v_sigma1": "",
+                            "rel_v_sigma1": ""
+                        })
+                    else:
+                        # acc contains 12 ints in order described above
+                        abs_h_sigma1, rel_h_sigma1, abs_v_sigma1, rel_v_sigma1 = acc[0], acc[1], acc[2], acc[3]
+                        w.writerow({
+                            "segment_name": gh.segment_name.strip(),
+                            "record_counter": counter,
+                            "row_lat_deg": row_lat_deg,
+                            "col_lon_deg": lon_deg,
+                            "quality_tag_id": tag,
+                            "abs_h_sigma1": abs_h_sigma1,
+                            "rel_h_sigma1": rel_h_sigma1,
+                            "abs_v_sigma1": abs_v_sigma1,
+                            "rel_v_sigma1": rel_v_sigma1
+                        })
+
+    return str(out_csv)
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main(input_dir, output_dir):
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    generated = []
+    for p in input_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in [".elv", ".qty"]:
+            try:
+                if p.suffix.lower() == ".elv":
+                    out = parse_elevation_file(str(p), str(output_dir))
+                    print(f"[OK] ELV: {p} -> {out}")
+                    generated.append(out)
+                else:
+                    out = parse_quality_file(str(p), str(output_dir))
+                    print(f"[OK] QTY: {p} -> {out}")
+                    generated.append(out)
+            except Exception as e:
+                print(f"[ERR] {p}: {e}")
+
+    print(f"Done. Extracted {len(generated)} CSV files to: {output_dir}")
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Extract Thales Terrain Database DEM (*.elv/*.qty) to CSV.")
+    ap.add_argument("input_dir", help="Root directory containing segment tiles (.elv/.qty)")
+    ap.add_argument("output_dir", help="Directory to write CSV outputs")
+    args = ap.parse_args()
+    main(args.input_dir, args.output_dir)
