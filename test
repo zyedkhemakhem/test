@@ -1,0 +1,19 @@
+import struct import csv from pathlib import Path 
+def read_thales_elevation_file(file_path, output_csv=None): """ Lit un fichier d'élévation Thales (.elv) et extrait les altitudes. Args: file_path (str): Chemin vers le fichier binaire. output_csv (str, optional): Chemin pour exporter en CSV. Si None, n'exporte pas. Returns: list: Matrice 2D des altitudes (ou None pour "No Data"). """ with open(file_path, "rb") as f: # --- 1. Lire le General Header (32 octets) --- general_header = f.read(32) 
+# Extraire le Byte Order (octet 2, 2 bytes) f.seek(2) byte_order_data = f.read(2) byte_order = "little" if byte_order_data == b'\x01\x00' else "big" 
+# Extraire Number of Columns (octet 27, 2 bytes) f.seek(26) num_columns = int.from_bytes(f.read(2), byteorder=byte_order) 
+# Extraire Number of Rows (octet 29, 2 bytes) f.seek(28) num_rows = int.from_bytes(f.read(2), byteorder=byte_order) 
+# Extraire No Data Value (octet 18, 2 bytes) f.seek(18) no_data_value = int.from_bytes(f.read(2), byteorder=byte_order, signed=True) 
+# --- 2. Lire l'Elevation File Header (20 octets) --- f.seek(32) # Début de l'Elevation Header elevation_header = f.read(20) 
+# Extraire Bytes Per Post (octet 12 de l'Elevation Header = position 32 + 12 = 44) f.seek(44) bytes_per_post = int.from_bytes(f.read(2), byteorder=byte_order) 
+# --- 3. Aller aux données (début à l'octet 52) --- f.seek(52) 
+# --- 4. Lire les altitudes --- elevations = [] for _ in range(num_rows): row = [] for _ in range(num_columns): data = f.read(bytes_per_post) if not data: # Fin de fichier prématurée raise ValueError("Fichier corrompu ou taille inattendue.") alt = int.from_bytes(data, byteorder=byte_order, signed=True) 
+# Appliquer les règles Thales if alt == no_data_value: row.append(None) # No Data elif alt == -20000: row.append(0) # Sea Water elif -30000 <= alt < -20000: row.append(alt + 30000) # Body Water else: row.append(alt) # Terrain elevations.append(row) 
+# --- 5. Exporter en CSV si demandé --- if output_csv: with open(output_csv, "w", newline="") as csvfile: writer = csv.writer(csvfile) for row in elevations: # Remplacer None par "No Data" pour le CSV csv_row = ["No Data" if x is None else x for x in row] writer.writerow(csv_row) print(f"✅ Export CSV terminé : {Path(output_csv).absolute()}") 
+return elevations 
+# --- EXEMPLE D'UTILISATION --- if __name__ == "__main__": # Remplacez par le chemin de votre fichier input_file = "terrain.elv" # ou "segment_001.elv", etc. 
+# Chemin pour le CSV (optionnel, mettez None si vous ne voulez pas exporter) output_csv = "elevations.csv" 
+try: elevations = read_thales_elevation_file(input_file, output_csv) 
+# Afficher les 5 premières lignes print("📊 Aperçu des données extraites (5 premières lignes) :") for i, row in enumerate(elevations[:5]): print(f"Ligne {i + 1}: {row}") 
+print(f"\n✅ Fichier lu avec succès !") print(f" - Colonnes: {len(elevations[0]) if elevations else 0}") print(f" - Lignes: {len(elevations)}") print(f" - Export CSV: {'Oui' if output_csv else 'Non'}") 
+except FileNotFoundError: print(f"❌ Erreur: Fichier introuvable -> {input_file}") except Exception as e: print(f"❌ Erreur lors de la lecture: {str(e)}")
