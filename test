@@ -6,202 +6,91 @@ from pathlib import Path
 ARCSEC_1_100_TO_DEG = 1.0 / (100.0 * 3600.0)
 SEA_OFFSET = -20000
 LAKE_OFFSET = -30000
-NO_DATA_DEFAULT = -9999  # doc indicates typical; we will override with header no_data
+NO_DATA_DEFAULT = -9999
 
-def read_exact(f, n):
-    b = f.read(n)
-    if len(b) != n:
-        raise EOFError(f"Unexpected EOF (wanted {n}, got {len(b)})")
-    return b
-
-def detect_endian_and_read_headers(f):
-    # Read first 6 bytes to get:
-    # - file_type_identifier (2)
-    # - byte_order_identifier (2)
-    # - byte_order_check_value (2) at offset 4
-    f.seek(0)
-    first6 = read_exact(f, 6)
-
-    # file_type_identifier can be read in both ways, we just validate check value.
-    for endian in ("<", ">"):
-        file_type = struct.unpack_from(f"{endian}h", first6, 0)[0]
-        boi = struct.unpack_from(f"{endian}h", first6, 2)[0]
-        check = struct.unpack_from(f"{endian}h", first6, 4)[0]
-        if check == 24575:
-            return endian, file_type, boi
-    raise ValueError("Could not detect endian (byte order check != 24575).")
-
-def parse_general_header(f, endian):
-    # general header size = 116 bytes
-    f.seek(0)
-    b = read_exact(f, 116)
-    idx = 0
-
-    file_type_identifier = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
-    byte_order_identifier = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
-    byte_order_check_value = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
-
-    segment_version_code = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    segment_creation_date = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-
-    segment_name_bytes = struct.unpack_from(f"{endian}14s", b, idx)[0]; idx += 14
-    segment_name = segment_name_bytes.decode("ascii", errors="ignore")
-
-    location_reference = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
-    elevation_reference = struct.unpack_from(f"{endian}h", b, idx)[0]; idx += 2
-
-    lon_nw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_nw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lon_ne = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_ne = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lon_sw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_sw = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lon_se = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_se = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-
-    lon_segment_size = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_segment_size = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-
-    lon_resolution = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_resolution = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-
-    lon_first_post = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    lat_first_post = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-
-    num_columns = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-    num_rows = struct.unpack_from(f"{endian}i", b, idx)[0]; idx += 4
-
-    content = []
-    for _ in range(10):
-        content.append(struct.unpack_from(f"{endian}h", b, idx)[0])
-        idx += 2
-
-    return {
-        "segment_name": segment_name.rstrip(),
-        "lon_resolution": lon_resolution,
-        "lat_resolution": lat_resolution,
-        "lon_first_post": lon_first_post,
-        "lat_first_post": lat_first_post,
-        "num_columns": num_columns,
-        "num_rows": num_rows,
-        "content": content,
-    }
-
-def parse_elv_header(f, endian):
-    # elevation header size = 20 bytes
-    eh = read_exact(f, 20)
-    ev_ver = struct.unpack_from(f"{endian}i", eh, 0)[0]
-    ev_creation = struct.unpack_from(f"{endian}i", eh, 4)[0]
-    data_scale = struct.unpack_from(f"{endian}h", eh, 8)[0]
-    elevation_type = struct.unpack_from(f"{endian}h", eh, 10)[0]
-    bytes_per_elev = struct.unpack_from(f"{endian}h", eh, 12)[0]
-    min_seg = struct.unpack_from(f"{endian}h", eh, 14)[0]
-    max_seg = struct.unpack_from(f"{endian}h", eh, 16)[0]
-    no_data = struct.unpack_from(f"{endian}h", eh, 18)[0]
-
-    return {
-        "data_scale": data_scale,
-        "bytes_per_elev": bytes_per_elev,
-        "no_data": no_data,
-        "elevation_type": elevation_type,
-    }
-
-def detect_water_offset(elev_raw, no_data):
-    # If NO_DATA -> no water logic
-    if elev_raw == no_data:
-        return None, None
-
-    # offsets are negative. Raw value can be offset + height*data_scale.
-    # So for sea/lake, elev_raw should be close to -20000 or -30000.
-    # We assume (height >=0), so raw is >= offset and tends to be in [offset, offset + something].
-    # We'll pick the closest offset.
-    candidates = [SEA_OFFSET, LAKE_OFFSET]
-    best = None
-    best_dist = None
-    for off in candidates:
-        dist = abs(elev_raw - off)
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best = off
-    # Heuristic acceptance: if we're reasonably close to one offset
-    # (If not, treat as no offset available.)
-    if best_dist is not None and best_dist <= 50000:  # very tolerant; adjust later if needed
-        return best, (elev_raw - best)
-    return None, elev_raw
-
-def elv_to_txt(elv_path, out_txt_path):
+def extract_elv_to_txt(elv_path: str):
     elv_path = Path(elv_path)
-    out_txt_path = Path(out_txt_path)
+    out_path = elv_path.with_suffix(".txt")
 
     with open(elv_path, "rb") as f:
-        endian, file_type, _boi = detect_endian_and_read_headers(f)
-        if file_type != 1:
-            raise ValueError(f"File is not elevation (.elv). file_type_identifier={file_type}")
+        endian = "<"
 
-        gh = parse_general_header(f, endian)
+        # ---- General header (116 bytes) ----
+        f.seek(0)
+        gh = f.read(116)
 
-        # after general header, we are at offset 116; elevation header begins now
-        f.seek(116)
-        eh = parse_elv_header(f, endian)
+        # Positions per document
+        # Need: segment_name(14), lon_resolution(i at 72), lat_resolution(i at 76),
+        # lon_first_post(i at 80), lat_first_post(i at 84), num_columns(i at 88), num_rows(i at 92)
+        segment_name = struct.unpack_from(endian + "14s", gh, 14)[0].decode("ascii", errors="ignore").rstrip()
 
-        if eh["bytes_per_elev"] != 2:
-            raise NotImplementedError(f"Only bytes_per_elev=2 supported. Got {eh['bytes_per_elev']}")
+        lon_resolution = struct.unpack_from(endian + "i", gh, 72)[0]
+        lat_resolution = struct.unpack_from(endian + "i", gh, 76)[0]
+        lon_first_post = struct.unpack_from(endian + "i", gh, 80)[0]
+        lat_first_post = struct.unpack_from(endian + "i", gh, 84)[0]
+        num_columns = struct.unpack_from(endian + "i", gh, 88)[0]
+        num_rows = struct.unpack_from(endian + "i", gh, 92)[0]
 
-        num_rows = gh["num_rows"]
-        num_cols = gh["num_columns"]
+        # ---- Elevation file header (20 bytes) ----
+        eh = f.read(20)
+        # i version(i=0..3), i creation(4..7), h data_scale(8..9), h elevation_type(10..11),
+        # h bytes_per_elev(12..13), h min(14..15), h max(16..17), h no_data(18..19)
+        data_scale = struct.unpack_from(endian + "h", eh, 8)[0]
+        bytes_per_elev = struct.unpack_from(endian + "h", eh, 12)[0]
+        no_data = struct.unpack_from(endian + "h", eh, 18)[0]
+        if no_data == 0x8000:  # rare/safety; ignore if not needed
+            no_data = NO_DATA_DEFAULT
 
-        data_scale = float(eh["data_scale"]) if eh["data_scale"] != 0 else 1.0
-        no_data = eh["no_data"]
+        # minimal assumption
+        # per doc: bytes_per_elev is 2 (h)
+        # record: counter(i) + min(h) + max(h) + lon_first(i) + lat_first(i) + N * elevation(h)
+        rec_header_fmt = endian + "i h h i i"   # 16 bytes
+        rec_header_size = struct.calcsize(rec_header_fmt)
+        record_size = rec_header_size + 2 * num_columns
 
-        # record layout:
-        # counter(i) + min(h) + max(h) + lon_first_record(i) + lat_first_record(i)
-        rec_prefix_fmt = f"{endian}i h h i i"  # 16 bytes total
-        rec_prefix_size = struct.calcsize(rec_prefix_fmt)
-        posts_fmt = f"{endian}{num_cols}h"
-        rec_size = rec_prefix_size + 2 * num_cols
+        lon_res_deg = lon_resolution * ARCSEC_1_100_TO_DEG
 
-        lon_res_deg = gh["lon_resolution"] * ARCSEC_1_100_TO_DEG
-        lat_res_deg = gh["lat_resolution"] * ARCSEC_1_100_TO_DEG
+        with open(out_path, "w", encoding="utf-8", newline="\n") as out:
+            # QGIS-friendly
+            out.write("lon;lat;elev_m;elev_m_real;segment\n")
 
-        out_txt_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_txt_path, "w", encoding="utf-8", newline="\n") as out:
-            # QGIS-friendly: lon/lat in WGS84 + elevation
-            out.write("lon_deg;lat_deg;elev_raw;elev_m;water_offset;elev_m_real\n")
+            scale_div = float(data_scale) if data_scale != 0 else 1.0
 
-            # row-major: each record has constant latitude (lat_first_record)
+            # iterate row-major: records = num_rows
             for r in range(num_rows):
-                block = read_exact(f, rec_size)
-                counter, _min_rec, _max_rec, lon_first_rec, lat_first_rec = struct.unpack_from(
-                    rec_prefix_fmt, block, 0
-                )
-                posts = struct.unpack_from(posts_fmt, block, rec_prefix_size)
+                block = f.read(record_size)
+                counter, _min_rec, _max_rec, lon_first_rec, lat_first_rec = struct.unpack_from(rec_header_fmt, block, 0)
+                posts_fmt = endian + f"{num_columns}h"
+                posts = struct.unpack_from(posts_fmt, block, rec_header_size)
 
                 lat_deg = lat_first_rec * ARCSEC_1_100_TO_DEG
-                lon0_deg = lon_first_rec * ARCSEC_1_100_TO_DEG
+                lon_start_deg = lon_first_rec * ARCSEC_1_100_TO_DEG
 
-                for c, elev_raw in enumerate(posts):
-                    if elev_raw == no_data:
-                        out.write(f"{lon0_deg + c*lon_res_deg:.10f};{lat_deg:.10f};;;\n".replace(";;;\n", ";;\n").strip() )
-                        # Above line is too hacky; simplify with explicit fields:
-                        # We'll just do: empty elev fields but keep water columns empty.
-                        out.write(f"{lon0_deg + c*lon_res_deg:.10f};{lat_deg:.10f};{elev_raw};\n" + ";;\n")
+                for c, raw in enumerate(posts):
+                    if raw == no_data:
                         continue
 
-                    elev_m = elev_raw / data_scale
-                    off, corrected_raw = detect_water_offset(elev_raw, no_data)
+                    elev_m = raw / scale_div
 
-                    if off is None:
-                        out.write(f"{lon0_deg + c*lon_res_deg:.10f};{lat_deg:.10f};{elev_raw};{elev_m:.3f};;\n")
+                    # water offset correction (sea/lake)
+                    # doc: if raw == offset + elev_m*scale then elev_real_m = (raw - offset)/scale
+                    if raw <= SEA_OFFSET:
+                        d_sea = abs(raw - SEA_OFFSET)
+                        d_lake = abs(raw - LAKE_OFFSET)
+                        if d_lake < d_sea:
+                            elev_m_real = (raw - LAKE_OFFSET) / scale_div
+                        else:
+                            elev_m_real = (raw - SEA_OFFSET) / scale_div
                     else:
-                        elev_m_real = corrected_raw / data_scale
-                        out.write(f"{lon0_deg + c*lon_res_deg:.10f};{lat_deg:.10f};{elev_raw};{elev_m:.3f};{off};{elev_m_real:.3f}\n")
+                        elev_m_real = elev_m
 
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python3 extract_elv_points_txt.py <input.elv> <output.txt>")
-        sys.exit(1)
-    elv_to_txt(sys.argv[1], sys.argv[2])
-    print("OK")
+                    lon_deg = lon_start_deg + c * lon_res_deg
+                    out.write(f"{lon_deg:.10f};{lat_deg:.10f};{elev_m:.3f};{elev_m_real:.3f};{segment_name}\n")
+
+    print(f"OK -> {out_path}")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print("Usage: python3 elv_extract_min.py <file.elv>")
+        sys.exit(1)
+    extract_elv_to_txt(sys.argv[1])
